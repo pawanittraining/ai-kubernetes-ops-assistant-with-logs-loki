@@ -1,3 +1,4 @@
+#### This document assume you have already kubernetes cluster installed, prometheus is deployed already, and loki deployed or you can follow for loki below
 # AI Kubernetes Operations Center — Phase 2
 
 Adds Kubernetes pod logs/events/node status, Loki node OS log search, historical Prometheus queries and charts rendered in chat.
