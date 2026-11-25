@@ -3,6 +3,10 @@
 
 Adds Kubernetes pod logs/events/node status, Loki node OS log search, historical Prometheus queries and charts rendered in chat.
 
+## Web UI Preview
+
+![Kubernetes AI Assistant Dashboard](docs/images/dashboard.png)
+
 ## 1. Install Python dependencies
 
 ```bash
