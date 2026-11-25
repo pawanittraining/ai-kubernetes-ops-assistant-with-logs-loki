@@ -1,0 +1,114 @@
+# Optional Kind example: ships node journal and common host log files to Loki.
+# The current Kind nodes store volatile journald files under /run/log/journal.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluent-bit-node-logs
+  namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluent-bit-node-logs
+  namespace: monitoring
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush        5
+        Log_Level    info
+        Parsers_File parsers.conf
+
+    [INPUT]
+        Name              tail
+        Tag               node.files
+        Path              /host/var/log/syslog,/host/var/log/messages,/host/var/log/kern.log
+        Read_from_Head    Off
+        Refresh_Interval  10
+        DB                /tail-db/node-files.db
+        Skip_Long_Lines   On
+
+    [INPUT]
+        Name              systemd
+        Tag               node.journal
+        Path              /host/run/log/journal
+        DB                /tail-db/systemd.db
+        Read_From_Tail    On
+
+    [FILTER]
+        Name    record_modifier
+        Match   node.*
+        Record  node ${NODE_NAME}
+        Record  job node-os
+
+    [OUTPUT]
+        Name        loki
+        Match       node.*
+        Host        loki.monitoring.svc.cluster.local
+        Port        3100
+        Labels      job=node-os,node=${NODE_NAME}
+        Line_Format json
+
+  parsers.conf: |
+    [PARSER]
+        Name        syslog-rfc3164
+        Format      regex
+        Regex       ^(?<time>[^ ]* +[^ ]* +[^ ]*) (?<host>[^ ]*) (?<ident>[a-zA-Z0-9_\/\.\-]*)(?:\[(?<pid>[0-9]+)\])?: (?<message>.*)$
+        Time_Key    time
+        Time_Format %b %d %H:%M:%S
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluent-bit-node-logs
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: fluent-bit-node-logs
+  template:
+    metadata:
+      labels:
+        app: fluent-bit-node-logs
+    spec:
+      serviceAccountName: fluent-bit-node-logs
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: fluent-bit
+          image: cr.fluentbit.io/fluent/fluent-bit:3.2
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: host-var-log
+              mountPath: /host/var/log
+              readOnly: true
+            - name: host-run-log-journal
+              mountPath: /host/run/log/journal
+              readOnly: true
+            - name: tail-db
+              mountPath: /tail-db
+            - name: config
+              mountPath: /fluent-bit/etc/
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: host-var-log
+          hostPath:
+            path: /var/log
+            type: Directory
+        - name: host-run-log-journal
+          hostPath:
+            path: /run/log/journal
+            type: Directory
+        - name: tail-db
+          emptyDir: {}
+        - name: config
+          configMap:
+            name: fluent-bit-node-logs
