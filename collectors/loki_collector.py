@@ -9,10 +9,11 @@ load_dotenv()
 class LokiCollector:
     """Read-only Loki HTTP API client. Requires a log shipper to populate labels."""
 
-    def __init__(self, url=None, timeout=None, node_label=None):
+    def __init__(self, url=None, timeout=None, node_label=None, labels=None):
         self.url = (url or os.getenv("LOKI_URL", "http://localhost:3100")).rstrip("/")
         self.timeout = int(timeout or os.getenv("LOKI_TIMEOUT", "20"))
         self.node_label = node_label or os.getenv("LOKI_NODE_LABEL", "node")
+        self.labels = labels or {}
         self.session = requests.Session()
 
     def health(self):
@@ -27,7 +28,10 @@ class LokiCollector:
     def query_node_logs(self, node, search="", since_minutes=60, limit=100):
         since_minutes = max(1, min(int(since_minutes), 24 * 60))
         limit = max(1, min(int(limit), 500))
-        selector = f'{{job="node-os",{self.node_label}="{self._escape(node)}"}}'
+        labels = {**self.labels, "job": "node-os", self.node_label: node}
+        selector = "{" + ",".join(
+            f'{key}="{self._escape(value)}"' for key, value in labels.items()
+        ) + "}"
         logql = selector
         if search:
             # Loki line filter; the value is escaped as a quoted string.

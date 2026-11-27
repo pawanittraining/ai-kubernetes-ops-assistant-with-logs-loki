@@ -9,16 +9,19 @@ load_dotenv()
 class KubernetesCollector:
     """Read-only Kubernetes API collector for pods, logs, events and nodes."""
 
-    def __init__(self, context=None):
-        context = context or os.getenv("KUBERNETES_CONTEXT") or None
-        try:
+    def __init__(self, context=None, in_cluster=False):
+        if in_cluster:
+            config.load_incluster_config()
+        else:
+            context = context or os.getenv("KUBERNETES_CONTEXT") or None
             if context:
                 config.load_kube_config(context=context)
             else:
-                config.load_kube_config()
-        except ConfigException:
-            # Supports running inside a Kubernetes cluster as well.
-            config.load_incluster_config()
+                try:
+                    config.load_kube_config()
+                except ConfigException:
+                    # Supports running inside a Kubernetes cluster as well.
+                    config.load_incluster_config()
         self.v1 = client.CoreV1Api()
 
     def list_namespaces(self):

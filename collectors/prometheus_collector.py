@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import requests
 from dotenv import load_dotenv
@@ -9,18 +10,21 @@ load_dotenv()
 class PrometheusCollector:
     """Read-only Prometheus HTTP API client."""
 
-    def __init__(self, url=None, timeout=None):
+    def __init__(self, url=None, timeout=None, labels=None):
         self.url = (url or os.getenv("PROMETHEUS_URL", "http://localhost:9090")).rstrip("/")
         self.timeout = int(timeout or os.getenv("PROMETHEUS_TIMEOUT", "15"))
+        self.labels = labels or {}
         self.session = requests.Session()
 
     @staticmethod
     def _escape(value):
         return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
-    @classmethod
-    def _selector(cls, **labels):
-        return ",".join(f'{k}="{cls._escape(v)}"' for k, v in labels.items() if v is not None)
+    def _selector(self, **labels):
+        matchers = {key: value for key, value in labels.items() if value is not None}
+        matchers.update(self.labels)
+        return ",".join(f'{key}="{self._escape(value)}"'
+                        for key, value in matchers.items())
 
     def _get(self, path, params):
         response = self.session.get(f"{self.url}{path}", params=params, timeout=self.timeout)
@@ -38,6 +42,45 @@ class PrometheusCollector:
             "query": promql, "start": start, "end": end, "step": step
         })
 
+    def metric_names(self):
+        """Return metric names known to this Prometheus target."""
+        params = {}
+        if self.labels:
+            params["match[]"] = "{" + self._selector() + "}"
+        response = self.session.get(
+            f"{self.url}/api/v1/label/__name__/values",
+            params=params,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("status") != "success":
+            raise RuntimeError(payload.get("error", "Could not list Prometheus metrics"))
+        values = payload.get("data")
+        if not isinstance(values, list) or not all(isinstance(x, str) for x in values):
+            raise RuntimeError("Prometheus returned an invalid metric-name response")
+        return sorted(values)
+
+    def query_metric(self, metric, matchers=None):
+        """Query one metric name, scoped by target and user-selected label matchers."""
+        if not isinstance(metric, str) or not re.fullmatch(
+            r"[a-zA-Z_:][a-zA-Z0-9_:]*", metric
+        ):
+            raise ValueError(f"Invalid Prometheus metric name: {metric!r}")
+        selector = self._selector(**(matchers or {}))
+        expression = f"{metric}{{{selector}}}" if selector else metric
+        return self.query(expression)
+
+    def query_metric_range(self, metric, start, end, step="60s", matchers=None):
+        """Range query for a metric name discovered from this Prometheus target."""
+        if not isinstance(metric, str) or not re.fullmatch(
+            r"[a-zA-Z_:][a-zA-Z0-9_:]*", metric
+        ):
+            raise ValueError(f"Invalid Prometheus metric name: {metric!r}")
+        selector = self._selector(**(matchers or {}))
+        expression = f"{metric}{{{selector}}}" if selector else metric
+        return self.query_range(expression, start, end, step)
+
     def health(self):
         return self.query("up")
 
@@ -54,13 +97,14 @@ class PrometheusCollector:
         return output
 
     def list_namespaces(self):
-        result = self.query("count by (namespace) (kube_pod_info)")
+        result = self.query(f"count by (namespace) (kube_pod_info{{{self._selector()}}})")
         return sorted({x.get("metric", {}).get("namespace") for x in result
                        if x.get("metric", {}).get("namespace")})
 
     def list_pods(self, namespace):
-        selector = self._selector(namespace=namespace)
-        result = self.query(f"count by (pod) (kube_pod_info{{{selector}}})")
+        result = self.query(
+            f"count by (pod) (kube_pod_info{{{self._selector(namespace=namespace)}}})"
+        )
         return sorted({x.get("metric", {}).get("pod") for x in result
                        if x.get("metric", {}).get("pod")})
 
@@ -83,13 +127,15 @@ class PrometheusCollector:
     def top_nodes_cpu(self, limit=5):
         limit = max(1, min(int(limit), 20))
         q = (f"topk({limit}, 100 * (1 - avg by (instance) "
-             f"(rate(node_cpu_seconds_total{{mode='idle'}}[5m]))))")
+             f"(rate(node_cpu_seconds_total{{{self._selector(mode='idle')}}}[5m]))))")
         return self.values(self.query(q))
 
     def top_nodes_memory(self, limit=5):
         limit = max(1, min(int(limit), 20))
+        selector = self._selector()
         q = (f"topk({limit}, 100 * (1 - "
-             f"(node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)))")
+             f"(node_memory_MemAvailable_bytes{{{selector}}} / "
+             f"node_memory_MemTotal_bytes{{{selector}}})))")
         return self.values(self.query(q))
 
     def pod_metrics(self, namespace, pod):
@@ -110,27 +156,27 @@ class PrometheusCollector:
 
     def metric_history(self, metric, hours=1, namespace=None, pod=None, node=None, step="60s"):
         """Return a bounded range query for one allow-listed metric."""
-        expressions = {
-            "pod_cpu": 'sum by (namespace,pod) (rate(container_cpu_usage_seconds_total{container!="",image!=""}[5m]))',
-            "pod_memory": 'sum by (namespace,pod) (container_memory_working_set_bytes{container!="",image!=""})',
-            "node_cpu": "100 * (1 - avg by (instance) (rate(node_cpu_seconds_total{mode='idle'}[5m])))",
-            "node_memory": "100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))",
-        }
-        if metric not in expressions:
+        if metric not in {"pod_cpu", "pod_memory", "node_cpu", "node_memory"}:
             raise ValueError(f"Unsupported metric: {metric}")
-        expr = expressions[metric]
-        matchers = []
-        if namespace:
-            matchers.append(f'namespace="{self._escape(namespace)}"')
-        if pod:
-            matchers.append(f'pod="{self._escape(pod)}"')
-        if node:
-            # node exporter commonly labels the target as instance, not node.
-            matchers.append(f'instance=~".*{self._escape(node)}.*"')
-        if matchers and metric.startswith("pod_"):
-            expr = expr.replace("{", "{" + ",".join(matchers) + ",", 1)
-        elif node and metric.startswith("node_"):
-            expr = expr.replace("{", "{" + ",".join(matchers) + ",", 1)
+        if metric == "pod_cpu":
+            selector = self._selector(namespace=namespace, pod=pod)
+            selector = (selector + "," if selector else "") + 'container!="",image!=""'
+            expr = (f"sum by (namespace,pod) (rate(container_cpu_usage_seconds_total"
+                    f"{{{selector}}}[5m]))")
+        elif metric == "pod_memory":
+            selector = self._selector(namespace=namespace, pod=pod)
+            selector = (selector + "," if selector else "") + 'container!="",image!=""'
+            expr = f"sum by (namespace,pod) (container_memory_working_set_bytes{{{selector}}})"
+        elif metric == "node_cpu":
+            instance = f".*{self._escape(node)}.*" if node else None
+            selector = self._selector(instance=instance, mode="idle")
+            expr = (f"100 * (1 - avg by (instance) "
+                    f"(rate(node_cpu_seconds_total{{{selector}}}[5m])))")
+        else:
+            instance = f".*{self._escape(node)}.*" if node else None
+            selector = self._selector(instance=instance)
+            expr = (f"100 * (1 - (node_memory_MemAvailable_bytes{{{selector}}} / "
+                    f"node_memory_MemTotal_bytes{{{selector}}}))")
         hours = max(1, min(int(hours), 24))
         end = int(time.time())
         start = end - hours * 3600
